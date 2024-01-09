@@ -5,7 +5,6 @@
 #For educational purposes, this script uses minimal external tools, and contains
 #essentially everything to train a network in a single script;
 
-
 using Flux
 import Flux.Optimise.update!
 import Flux: gradient
@@ -21,7 +20,9 @@ Random.seed!(4)
 
 #data location
 #load seismic data cube (1.5 GB, (1199, 1200, 876))
-data_dir  = "/home/bas*/Documents/GITrepos/HyperbolicNetworkExamples/Examples_Code/data/train"
+#download data: https://github.com/olivesgatech/facies_classification_benchmark
+#               https://zenodo.org/records/3755060
+data_dir  = ""
 
 data_cube_train = npzread(joinpath(data_dir,"train_seismic.npy"));
 data_cube_train = convert(Array{Float32,3},data_cube_train)
