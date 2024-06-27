@@ -23,7 +23,6 @@ Random.seed!(4)
 #download data: https://github.com/olivesgatech/facies_classification_benchmark
 #               https://zenodo.org/records/3755060
 data_dir  = ""
-
 data_cube_train = npzread(joinpath(data_dir,"train_seismic.npy"));
 data_cube_train = convert(Array{Float32,3},data_cube_train)
 n = size(data_cube_train);
@@ -99,7 +98,7 @@ data_cube_train   = reshape(data_cube_train,size(data_cube_train)...,1,1)
 labels_cube_train = reshape(labels_cube_train,size(labels_cube_train)...,1)
 
 #increase the input-output channel count
-data_cube_train = repeat(data_cube_train,outer=[1,1,1,4,1])
+data_cube_train = repeat(data_cube_train,outer=[1,1,1,12,1])
 
 #function (for training) that grabs a sub-cube from the full data volume, randomly located in the
 #full data volume, but it contains the entire depth range. Returns the sub-cube for
@@ -114,9 +113,12 @@ function GetSubCube(data_cube,label_cube,mask,n_sub)
   sub_data_cube  = data_cube[1+center_1-ceil(Int,n_sub[1]/2):center_1+ceil(Int,n_sub[1]/2),1+center_2-ceil(Int,n_sub[2]/2):center_2+ceil(Int,n_sub[2]/2),1:n_sub[3],:,:]
   sub_label_cube = label_cube[1+center_1-ceil(Int,n_sub[1]/2):center_1+ceil(Int,n_sub[1]/2),1+center_2-ceil(Int,n_sub[2]/2):center_2+ceil(Int,n_sub[2]/2),1:n_sub[3],:,:]
   sub_mask       = mask[1+center_1-ceil(Int,n_sub[1]/2):center_1+ceil(Int,n_sub[1]/2),1+center_2-ceil(Int,n_sub[2]/2):center_2+ceil(Int,n_sub[2]/2),1:n_sub[3]]
+  
+  #sub_data_cube = repeat(sub_data_cube,outer=[1,1,1,12,1])
   sub_data_cube  = sub_data_cube|>gpu
   sub_label_cube = sub_label_cube|>gpu
   sub_mask       = sub_mask|>gpu
+  
   return sub_data_cube, sub_label_cube, sub_mask
 end
 
@@ -156,8 +158,8 @@ HN = H = NetworkHyperbolic3D(n_chan_in,architecture; α)
 conv_kernel_mem_BLR = 0
 conv_kernel_mem_reg = 0
 for i=1:length(H.HL)
-  conv_kernel_mem_BLR = conv_kernel_mem_BLR + 27*prod(size(H.HL[i].W)[4:5])*32/(1000^3)
-  conv_kernel_mem_reg = conv_kernel_mem_reg + 27*maximum(size(H.HL[i].W)[4:5])^2*32/(1000^3)
+  conv_kernel_mem_BLR = conv_kernel_mem_BLR + 27*prod(size(H.HL[i].W)[4:5])*4/(1000^3)
+  conv_kernel_mem_reg = conv_kernel_mem_reg + 27*maximum(size(H.HL[i].W)[4:5])^2*4/(1000^3)
 end
 
 println(string("memory for conv. kernels - block-low-rank layers: ",conv_kernel_mem_BLR," Gb"))
@@ -166,11 +168,12 @@ println(string("memory for conv. kernels - standard layers: ",conv_kernel_mem_re
 
 #compute memory for states, and what it would be for a non-reversible direct-equivalent
 input_tensor_nr_elements         = prod(size(train_data_test))
-input_tensor_Gb                  = input_tensor_nr_elements*32/(1000^3)
+input_tensor_Gb                  = input_tensor_nr_elements*4/(1000^3)
 fully_hyperbolic_inv_network_mem = 3*input_tensor_Gb
-non_inv_network_mem              = length(architecture)*fully_hyperbolic_inv_network_mem
+non_inv_network_mem              = length(architecture)*input_tensor_Gb
 println(string("memory for states fully invertible hyperbolic network: ",fully_hyperbolic_inv_network_mem," Gb"))
 println(string("memory for states non-invertible network: ",non_inv_network_mem," Gb"))
+train_data_test = []
 
 # define loss functions for the labels and corresponding gradients
 #From Flux documentation: "This is mathematically equivalent to crossentropy(softmax(ŷ), y), but is more numerically stable than using functions crossentropy and softmax separately"
@@ -266,7 +269,6 @@ function Train(HN,batchsize,use_gpu,train_data,val_data,train_labels,val_labels,
 
     for p in get_params(HN) #loop over network parameters
         update!(opt, p.data, p.grad) #update network weights
-        #update!(lr_decay_fn, p.data, p.grad)
     end
     clear_grad!(HN)
 
@@ -280,13 +282,13 @@ function Train(HN,batchsize,use_gpu,train_data,val_data,train_labels,val_labels,
         end
         f = loss(HN,use_gpu,val_data_sub_cube,val_labels_sub_cube,lossf,lossg,active_channels,mask_val_sub_cube,[],[])
         fvalepoch_val = fvalepoch_val + f/sum(mask_val_sub_cube)
+        clear_grad!(HN)
       end
       fval_val[print_counter]   = fvalepoch_val/5
        print("Iteration: ", j, "; ftrain = ", fval_train[print_counter], "; fval = ", fval_val[print_counter],"\n")
        print_counter = print_counter + 1
-      clear_grad!(HN)
+      
     end
-
   end
 
   fval_train   = fval_train[1:print_counter-1]
@@ -294,6 +296,74 @@ function Train(HN,batchsize,use_gpu,train_data,val_data,train_labels,val_labels,
 
   return fval_train, fval_val
 end
+
+function IoU(pred_in,labels_in,mask_train,mask_val)
+  #INPUT IS PREDICTION AFTER SOFTMAX
+   pred   = pred_in[50:end-50,50:end-50,50:end-50,:]
+   pred_train = pred[findall(mask_train[50:end-50,50:end-50,50:end-50] .== 1),:]
+   pred_val   = pred[findall(mask_val[50:end-50,50:end-50,50:end-50] .== 1),:]
+ 
+   labels = labels_in[50:end-50,50:end-50,50:end-50,:]
+   threshold = 0.5
+ 
+       pred_thres            = zeros(Int,size(pred)[1:3])
+       pos_inds              = findall(pred[:,:,:,1] .< threshold)
+       pred_thres[pos_inds] .= 1
+ 
+      train_inds = findall(mask_train[50:end-50,50:end-50,50:end-50] .== 1)
+      val_inds   = findall(mask_val[50:end-50,50:end-50,50:end-50] .== 1)
+ 
+       pos_pred_inds = findall(pred_thres.==1);
+       pos_pred_inds_train = findall(pred_thres[train_inds].==1)
+       pos_pred_inds_val = findall(pred_thres[val_inds].==1)
+       neg_pred_inds = findall(pred_thres.==0)
+       neg_pred_inds_train = findall(pred_thres[train_inds].==0)
+       neg_pred_inds_val = findall(pred_thres[val_inds].==0)
+ 
+       true_pos_inds = findall(labels[:,:,:,1] .== 1)
+       true_pos_inds_train = findall(labels[train_inds,1] .== 1)
+       true_pos_inds_val = findall(labels[val_inds,1] .== 1)
+       true_neg_inds = findall(labels[:,:,:,1] .== 0)
+       true_neg_inds_train = findall(labels[train_inds,1] .== 0)
+       true_neg_inds_val = findall(labels[val_inds,1] .== 0)
+ 
+       #IoU
+       IoU_pos = length(intersect(pos_pred_inds,true_pos_inds))/length(union(pos_pred_inds,true_pos_inds))
+       IoU_neg = length(intersect(neg_pred_inds,true_neg_inds))/length(union(neg_pred_inds,true_neg_inds))
+ 
+       IoU_pos_train = length(intersect(pos_pred_inds_train,true_pos_inds_train))/length(union(pos_pred_inds_train,true_pos_inds_train))
+       IoU_neg_train = length(intersect(neg_pred_inds_train,true_neg_inds_train))/length(union(neg_pred_inds_train,true_neg_inds_train))
+ 
+       IoU_pos_val = length(intersect(pos_pred_inds_val,true_pos_inds_val))/length(union(pos_pred_inds_val,true_pos_inds_val))
+       IoU_neg_val = length(intersect(neg_pred_inds_val,true_neg_inds_val))/length(union(neg_pred_inds_val,true_neg_inds_val))
+ 
+   return IoU_pos, IoU_neg, IoU_pos_train, IoU_neg_train, IoU_pos_val, IoU_neg_val
+   end
+ 
+ 
+ function IoU(pred_in,labels_in)
+ #INPUT IS PREDICTION AFTER SOFTMAX
+  pred   = pred_in[50:end-50,50:end-50,50:end-50,:]
+  labels = labels_in[50:end-50,50:end-50,50:end-50,:]
+  threshold = 0.5
+ 
+      pred_thres = zeros(Int,size(pred)[1:3])
+      pos_inds   = findall(pred[:,:,:,1] .< threshold)
+      pred_thres[pos_inds] .= 1
+ 
+      pos_pred_inds = findall(pred_thres.==1)
+      neg_pred_inds = findall(pred_thres.==0)
+ 
+      true_pos_inds = findall(labels[:,:,:,1] .== 1)
+      true_neg_inds = findall(labels[:,:,:,1] .== 0)
+ 
+      #IoU
+      IoU_pos = length(intersect(pos_pred_inds,true_pos_inds))/length(union(pos_pred_inds,true_pos_inds))
+      IoU_neg = length(intersect(neg_pred_inds,true_neg_inds))/length(union(neg_pred_inds,true_neg_inds))
+ 
+ 
+  return IoU_pos, IoU_neg
+ end
 
 #re-initialize the network using standard initialization
 #(in case some tests above accumulated a gradient or changed the intial weights)
@@ -317,10 +387,11 @@ opt     = Flux.ADAM(1f-4)
 fval_train2, fval_val2 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
 
 #turn off data augmentation
+maxiter      = 240
 flip_dims    = []
 permute_dims = []
 fval_train3, fval_val3 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
-fval_train3, fval_val3 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
+
 
 figure();
 plot([fval_train1;fval_train2;fval_train3])
@@ -333,8 +404,6 @@ plot([fval_val1;fval_val2;fval_val3])
   contribution_counter = zeros(Int64,size(data_cube_train)[1:3])
   for i=1:7
     for j=1:19
-      println(i)
-      println(j)
       data_cube_temp = data_cube_train[25*(i-1)+1:25*(i-1)+248,25*(j-1)+1:25*(j-1)+248,:,:] |> gpu
       data_cube_temp = reshape(data_cube_temp,size(data_cube_temp)...,1)
       contribution_counter[25*(i-1)+1:25*(i-1)+248,25*(j-1)+1:25*(j-1)+248,:,:] .+= 1
@@ -522,3 +591,161 @@ plot([fval_val1;fval_val2;fval_val3])
     HN.HL[i].b.data = b_Array[i]
  end
  HN = HN|>gpu
+
+##############################################################################################################################
+#### What would the maximum network size be if we didn't use block low-rank layers, or didn't use an invertible network? #####
+##############################################################################################################################
+
+train_data_test, ~, ~ = GetSubCube(data_cube_train,labels_cube_train,label_mask_train,n_sub);
+
+#original (invertible and with block low rank layers)
+#architecture = ((0, 8), (0, 8), (-1, 16),(0, 16), (0, 16), (-1, 32), (0, 32),(0, 32),(-1, 32),(0, 32),(0, 32),(0, 32),(0, 32),(0, 32),(0, 32),(0, 32),(0, 32),(0, 32),(1, 32),(0, 32),(0, 32),(1, 16),(0, 16),(0, 16),(1, 8),(0, 8),(0, 8),(0, 8),(0, 8),(0, 8))
+
+#keep the block low-rank layers, but use a shorter network with one level fewer (network a)
+#architecture = ((0, 8),  (0, 8),  (-1, 16),(0, 16), (0, 16), (-1, 32),  (0, 32),  (0, 32), (0, 32), (0, 32), (0, 32), (0, 32), (0, 32), (0, 32), (0, 32), (0, 32),  (0, 32),(1, 16),(0, 16),(0, 16),(1, 8),(0, 8),(0, 8),(0, 8),(0, 8),(0, 8))
+
+#don't use the block low-rank layers, and use a much shorter network with one level fewer (network b)
+architecture = ((0, 12), (0, 12), (-1, 96),(0, 96), (-1, 768), (0, 768),(1, 96),(0, 96),(1, 12),(0, 12),(0, 12),(0, 12),(0, 12),(0, 12))
+
+
+k = 3   # kernel size
+s = 1   # stride
+p = 1   # padding
+n_chan_in = size(data_cube_train,4)
+α = 0.2^2 #artificial time-step in the nonlinear telegraph equation discretization that is the neural network
+HN = H = NetworkHyperbolic3D(n_chan_in,architecture; α)
+
+#compute memory for convolutional kernels & what it would be without block-low-rank layers
+conv_kernel_mem_BLR = 0
+conv_kernel_mem_reg = 0
+for i=1:length(H.HL)
+  conv_kernel_mem_BLR = conv_kernel_mem_BLR + 27*prod(size(H.HL[i].W)[4:5])*4/(1000^3)
+  conv_kernel_mem_reg = conv_kernel_mem_reg + 27*maximum(size(H.HL[i].W)[4:5])^2*4/(1000^3)
+end
+
+println(string("memory for conv. kernels - block-low-rank layers: ",conv_kernel_mem_BLR," GB"))
+println(string("memory for conv. kernels - standard layers: ",conv_kernel_mem_reg," GB"))
+
+
+#compute memory for states, and what it would be for a non-reversible direct-equivalent
+input_tensor_nr_elements         = prod(size(train_data_test))
+input_tensor_Gb                  = input_tensor_nr_elements*4/(1000^3)
+fully_hyperbolic_inv_network_mem = 3*input_tensor_Gb
+non_inv_network_mem              = length(architecture)*input_tensor_Gb
+println(string("memory for states fully invertible hyperbolic network: ",fully_hyperbolic_inv_network_mem," GB"))
+println(string("memory for states non-invertible network: ",non_inv_network_mem," GB"))
+train_data_test = []
+
+HN = H = NetworkHyperbolic3D(n_chan_in,architecture; α)
+if use_gpu==true
+  HN           = H |> gpu
+end
+
+maxiter      = 120
+opt          = Flux.ADAM(1f-3)
+flip_dims    = [1,2]
+permute_dims = [1,2]
+batchsize    = 4
+
+#train network
+#1st round
+fval_train1, fval_val1 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
+
+#reduce initial stepsize
+opt     = Flux.ADAM(1f-4)
+fval_train2, fval_val2 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
+
+#turn off data augmentation
+maxiter      = 240
+flip_dims    = []
+permute_dims = []
+fval_train3, fval_val3 = Train(HN,batchsize,use_gpu,data_cube_train,data_cube_train,labels_cube_train_1hot,labels_cube_train_1hot,wCESM,gwCESM,active_channels,label_mask_train,label_mask_val,flip_dims,permute_dims,maxiter,opt)
+
+figure();
+plot([fval_train1;fval_train2;fval_train3])
+plot([fval_val1;fval_val2;fval_val3])
+
+
+#plot training results
+
+  #predict the full data volume, in pieces with overlap
+  full_output = zeros(Float32,size(data_cube_train)[1:3]...,2)
+  contribution_counter = zeros(Int64,size(data_cube_train)[1:3])
+  for i=1:7
+    for j=1:19
+      data_cube_temp = data_cube_train[25*(i-1)+1:25*(i-1)+248,25*(j-1)+1:25*(j-1)+248,:,:] |> gpu
+      data_cube_temp = reshape(data_cube_temp,size(data_cube_temp)...,1)
+      contribution_counter[25*(i-1)+1:25*(i-1)+248,25*(j-1)+1:25*(j-1)+248,:,:] .+= 1
+      p1, prediction, ~ = HN.forward(data_cube_temp, data_cube_temp)
+      prediction = prediction |> cpu
+      full_output[25*(i-1)+1:25*(i-1)+248,25*(j-1)+1:25*(j-1)+248,:,:] .+= prediction[:,:,:,1:2]
+    end
+  end
+
+  full_output[:,:,:,1] ./= contribution_counter
+  full_output[:,:,:,2] ./= contribution_counter
+
+  prediction = softmax(full_output[:,:,:,active_channels,1],dims=4);
+
+  #prediction = prediction |> cpu
+  prediction_threshold_inds = argmax(prediction[:,:,:,:,1],dims=4)
+  prediction_threshold      = zeros(Float32,size(prediction))
+  prediction_threshold[prediction_threshold_inds] .= 1
+
+  #Plot 3 cross sections, with training validation labels overlaid
+  plot_ind_x = 160
+  plot_ind_y = 300
+  plot_ind_z = 80
+
+  figure(figsize=(10,10));
+  subplot(3,2,1);
+  imshow(data_cube_train[:,plot_ind_y,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[:,plot_ind_y,:,2,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,plot_ind_y,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, Y=",string(plot_ind_y)));ylabel("Z");xlabel("X")
+  subplot(3,2,2);
+  imshow(data_cube_train[:,plot_ind_y,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(prediction_threshold[:,plot_ind_y,:,1,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,plot_ind_y,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, Y=",string(plot_ind_y)));ylabel("Z");xlabel("X")
+
+  subplot(3,2,3);
+  imshow(data_cube_train[plot_ind_x,:,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[plot_ind_x,:,:,2,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[plot_ind_x,:,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, X=",string(plot_ind_x)));ylabel("Z");xlabel("Y")
+  subplot(3,2,4);
+  imshow(data_cube_train[plot_ind_x,:,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(prediction_threshold[plot_ind_x,:,:,1,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[plot_ind_x,:,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, X=",string(plot_ind_x)));ylabel("Z");xlabel("Y")
+
+  subplot(3,2,5);
+  imshow(data_cube_train[:,:,plot_ind_z,1,1],cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[:,:,plot_ind_z,2,1],cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,:,plot_ind_z],cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, Z=",string(plot_ind_z)));ylabel("X");xlabel("Y")
+  subplot(3,2,6);
+  imshow(data_cube_train[:,:,plot_ind_z,1,1],cmap="Greys",vmin=-3,vmax=3);imshow(prediction_threshold[:,:,plot_ind_z,1,1],cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,:,plot_ind_z],cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, Z=",string(plot_ind_z)));ylabel("X");xlabel("Y")
+  savefig("data_label_prediction_train.png")
+
+  figure(figsize=(10,10));
+  subplot(3,2,1);
+  imshow(data_cube_train[:,plot_ind_y,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[:,plot_ind_y,:,2,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,plot_ind_y,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, Y=",string(plot_ind_y)));ylabel("Z");xlabel("X")
+  subplot(3,2,2);
+  imshow(data_cube_train[:,plot_ind_y,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(prediction[:,plot_ind_y,:,1,1]',cmap="jet",alpha=0.3,vmin=0.4,vmax=0.6);imshow(3.0*label_mask_train[:,plot_ind_y,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, Y=",string(plot_ind_y)));ylabel("Z");xlabel("X")
+
+  subplot(3,2,3);
+  imshow(data_cube_train[plot_ind_x,:,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[plot_ind_x,:,:,2,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[plot_ind_x,:,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, X=",string(plot_ind_x)));ylabel("Z");xlabel("Y")
+  subplot(3,2,4);
+  imshow(data_cube_train[plot_ind_x,:,:,1,1]',cmap="Greys",vmin=-3,vmax=3);imshow(prediction[plot_ind_x,:,:,1,1]',cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[plot_ind_x,:,:]',cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, X=",string(plot_ind_x)));ylabel("Z");xlabel("Y")
+
+  subplot(3,2,5);
+  imshow(data_cube_train[:,:,plot_ind_z,1,1],cmap="Greys",vmin=-3,vmax=3);imshow(labels_cube_train[:,:,plot_ind_z,2,1],cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,:,plot_ind_z],cmap="Greys",alpha=0.2)
+  ;title(string("Data + Labels, Z=",string(plot_ind_z)));ylabel("Y");xlabel("X")
+  subplot(3,2,6);
+  imshow(data_cube_train[:,:,plot_ind_z,1,1],cmap="Greys",vmin=-3,vmax=3);imshow(prediction[:,:,plot_ind_z,1,1],cmap="jet",alpha=0.3);imshow(3.0*label_mask_train[:,:,plot_ind_z],cmap="Greys",alpha=0.2)
+  ;title(string("Data + Prediction, Z=",string(plot_ind_z)));ylabel("Y");xlabel("X")
+  savefig("data_label_probs_train.png")
+
+#Compute IoU
+IoU_pos, IoU_neg, IoU_pos_train, IoU_neg_train, IoU_pos_val, IoU_neg_val = IoU(prediction_threshold,labels_cube_train,label_mask_train,label_mask_val)
+IoU_class_total = [IoU_pos, IoU_neg]
+IoU_class_train = [IoU_pos_train, IoU_neg_train]
+IoU_class_val = [IoU_pos_val, IoU_neg_val]
+
